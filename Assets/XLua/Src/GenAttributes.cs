@@ -14,6 +14,7 @@ namespace XLua
     public enum GenFlag
     {
         No = 0,
+        [Obsolete("use GCOptimizeAttribute instead")]
         GCOptimize = 1
     }
 
@@ -63,13 +64,18 @@ namespace XLua
 
     }
 
+    [Flags]
     public enum HotfixFlag
     {
         Stateless = 0,
         Stateful = 1,
+        ValueTypeBoxing = 2,
+        IgnoreProperty = 4,
+        IgnoreNotPublic = 8,
+        Inline = 16,
+        IntKey = 32
     }
 
-    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct)]
     public class HotfixAttribute : Attribute
     {
         HotfixFlag flag;
@@ -92,6 +98,7 @@ namespace XLua
     {
     }
 
+#if !XLUA_GENERAL
     public static class SysGenConfig
     {
         [GCOptimize]
@@ -126,6 +133,7 @@ namespace XLua
             }
         }
     }
+#endif
 }
 
 

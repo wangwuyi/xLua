@@ -46,14 +46,65 @@ namespace XLua
             return ret;
         }
 
-        public static IEnumerable<Type> GetAllTypes()
+#if UNITY_WSA && !UNITY_EDITOR
+        public static List<Assembly> _assemblies;
+        public static List<Assembly> GetAssemblies()
+        {
+            if (_assemblies == null)
+            {
+                System.Threading.Tasks.Task t = new System.Threading.Tasks.Task(() =>
+                {
+                    _assemblies = GetAssemblyList().Result;
+                });
+                t.Start();
+                t.Wait();
+            }
+            return _assemblies;
+            
+        }
+        public static async System.Threading.Tasks.Task<List<Assembly>> GetAssemblyList()
+        {
+            List<Assembly> assemblies = new List<Assembly>();
+            //return assemblies;
+            var files = await Windows.ApplicationModel.Package.Current.InstalledLocation.GetFilesAsync();
+            if (files == null)
+                return assemblies;
+
+            foreach (var file in files.Where(file => file.FileType == ".dll" || file.FileType == ".exe"))
+            {
+                try
+                {
+                    assemblies.Add(Assembly.Load(new AssemblyName(file.DisplayName)));
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine(ex.Message);
+                }
+
+            }
+            return assemblies;
+        }
+        public static IEnumerable<Type> GetAllTypes(bool exclude_generic_definition = true)
+        {
+            var assemblies = GetAssemblies();
+            return from assembly in assemblies
+                   where !(assembly.IsDynamic)
+                   from type in assembly.GetTypes()
+                   where exclude_generic_definition ? !type.GetTypeInfo().IsGenericTypeDefinition : true
+                   select type;
+        }
+#else
+        public static IEnumerable<Type> GetAllTypes(bool exclude_generic_definition = true)
         {
             return from assembly in AppDomain.CurrentDomain.GetAssemblies()
+#if UNITY_EDITOR || XLUA_GENERAL
                                           where !(assembly.ManifestModule is System.Reflection.Emit.ModuleBuilder)
-                                          from type in assembly.GetExportedTypes()
-                                          where !type.IsGenericTypeDefinition
+#endif
+                                          from type in assembly.GetTypes()
+                                          where exclude_generic_definition ? !type.IsGenericTypeDefinition() : true
                                           select type;
         }
+#endif
 
         static LuaCSFunction genFieldGetter(Type type, FieldInfo field)
         {
@@ -91,7 +142,7 @@ namespace XLua
                 {
                     ObjectTranslator translator = ObjectTranslatorPool.Instance.Find(L);
                     object val = translator.GetObject(L, 1, field.FieldType);
-                    if (field.FieldType.IsValueType && val == null)
+                    if (field.FieldType.IsValueType() && val == null)
                     {
                         return LuaAPI.luaL_error(L, type.Name + "." + field.Name + " Expected type " + field.FieldType);
                     }
@@ -112,7 +163,7 @@ namespace XLua
                     }
 
                     object val = translator.GetObject(L, 2, field.FieldType);
-                    if (field.FieldType.IsValueType && val == null)
+                    if (field.FieldType.IsValueType() && val == null)
                     {
                         return LuaAPI.luaL_error(L, type.Name + "." + field.Name + " Expected type " + field.FieldType);
                     }
@@ -173,7 +224,7 @@ namespace XLua
                 {
                     ObjectTranslator translator = ObjectTranslatorPool.Instance.Find(L);
                     object val = translator.GetObject(L, 1, prop.PropertyType);
-                    if (prop.PropertyType.IsValueType && val == null)
+                    if (prop.PropertyType.IsValueType() && val == null)
                     {
                         return LuaAPI.luaL_error(L, type.Name + "." + prop.Name + " Expected type " + prop.PropertyType);
                     }
@@ -201,7 +252,7 @@ namespace XLua
                     }
 
                     object val = translator.GetObject(L, 2, prop.PropertyType);
-                    if (prop.PropertyType.IsValueType && val == null)
+                    if (prop.PropertyType.IsValueType() && val == null)
                     {
                         return LuaAPI.luaL_error(L, type.Name + "." + prop.Name + " Expected type " + prop.PropertyType);
                     }
@@ -218,21 +269,13 @@ namespace XLua
             }
         }
 
-        static Dictionary<string, string> support_op = new Dictionary<string, string>()
-        {
-            { "op_Addition", "__add" },
-            { "op_Subtraction", "__sub" },
-            { "op_Multiply", "__mul" },
-            { "op_Division", "__div" },
-            { "op_Equality", "__eq" },
-            { "op_UnaryNegation", "__unm" },
-            { "op_LessThan", "__lt" },
-            { "op_LessThanOrEqual", "__le" },
-            { "op_Modulus", "__mod" }
-        };
-
         static LuaCSFunction genItemGetter(Type type, PropertyInfo[] props)
         {
+            props = props.Where(prop => !prop.GetIndexParameters()[0].ParameterType.IsAssignableFrom(typeof(string))).ToArray();
+            if (props.Length == 0)
+            {
+                return null;
+            }
             Type[] params_type = new Type[props.Length];
             for(int i = 0; i < props.Length; i++)
             {
@@ -333,15 +376,21 @@ namespace XLua
         {
             return (RealStatePtr L) =>
             {
-                ObjectTranslator translator = ObjectTranslatorPool.Instance.Find(L);
-                return translator.TranslateToEnumToTop(L, type, 1);
+                try
+                {
+                    ObjectTranslator translator = ObjectTranslatorPool.Instance.Find(L);
+                    return translator.TranslateToEnumToTop(L, type, 1);
+                }
+                catch(Exception e)
+                {
+                    return LuaAPI.luaL_error(L, "cast to " + type + " exception:" + e);
+                }
             };
         }
 
-        static Dictionary<Type, IEnumerable<MethodInfo>> extension_method_map = null;
         static IEnumerable<MethodInfo> GetExtensionMethodsOf(Type type_to_be_extend)
         {
-            if (extension_method_map == null)
+            if (InternalGlobals.extensionMethodMap == null)
             {
                 List<Type> type_def_extention_method = new List<Type>();
 
@@ -352,41 +401,22 @@ namespace XLua
                     Type type = enumerator.Current;
                     if (type.IsDefined(typeof(ExtensionAttribute), false)  && (
                             type.IsDefined(typeof(ReflectionUseAttribute), false)
-#if UNITY_EDITOR
+#if UNITY_EDITOR || XLUA_GENERAL
                             || type.IsDefined(typeof(LuaCallCSharpAttribute), false)
 #endif
                         ))
                     {
                         type_def_extention_method.Add(type);
                     }
-                    else if(!type.IsInterface && typeof(ReflectionConfig).IsAssignableFrom(type))
-                    {
-                        var tmp = (Activator.CreateInstance(type) as ReflectionConfig).ReflectionUse;
-                        if (tmp != null)
-                        {
-                            type_def_extention_method.AddRange(tmp
-                                .Where(t => t.IsDefined(typeof(ExtensionAttribute), false)));
-                        }
-                    }
-#if UNITY_EDITOR
-                    else if (!type.IsInterface && typeof(GenConfig).IsAssignableFrom(type))
-                    {
-                        var tmp = (Activator.CreateInstance(type) as GenConfig).CSharpCallLua;
-                        if (tmp != null)
-                        {
-                            type_def_extention_method.AddRange(tmp
-                            .Where(t => t.IsDefined(typeof(ExtensionAttribute), false)));
-                        }
-                    }
-#endif
-                    if (!type.IsAbstract || !type.IsSealed) continue;
+
+                    if (!type.IsAbstract() || !type.IsSealed()) continue;
 
                     var fields = type.GetFields(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
                     for (int i = 0; i < fields.Length; i++)
                     {
                         var field = fields[i];
                         if ((field.IsDefined(typeof(ReflectionUseAttribute), false)
-#if UNITY_EDITOR
+#if UNITY_EDITOR || XLUA_GENERAL
                             || field.IsDefined(typeof(LuaCallCSharpAttribute), false)
 #endif
                             ) && (typeof(IEnumerable<Type>)).IsAssignableFrom(field.FieldType))
@@ -401,7 +431,7 @@ namespace XLua
                     {
                         var prop = props[i];
                         if ((prop.IsDefined(typeof(ReflectionUseAttribute), false)
-#if UNITY_EDITOR
+#if UNITY_EDITOR || XLUA_GENERAL
                             || prop.IsDefined(typeof(LuaCallCSharpAttribute), false)
 #endif
                             ) && (typeof(IEnumerable<Type>)).IsAssignableFrom(prop.PropertyType))
@@ -413,13 +443,13 @@ namespace XLua
                 }
                 enumerator.Dispose();
 
-                extension_method_map = (from type in type_def_extention_method
+                InternalGlobals.extensionMethodMap = (from type in type_def_extention_method
                                         from method in type.GetMethods(BindingFlags.Static | BindingFlags.Public)
-                                        where !method.ContainsGenericParameters && method.IsDefined(typeof(ExtensionAttribute), false)
-                                        group method by method.GetParameters()[0].ParameterType).ToDictionary(g => g.Key, g => g as IEnumerable<MethodInfo>);
+                                        where IsSupportedExtensionMethod(method)
+                                        group method by getExtendedType(method)).ToDictionary(g => g.Key, g => g as IEnumerable<MethodInfo>);
             }
             IEnumerable<MethodInfo> ret = null;
-            extension_method_map.TryGetValue(type_to_be_extend, out ret);
+            InternalGlobals.extensionMethodMap.TryGetValue(type_to_be_extend, out ret);
             return ret;
         }
 
@@ -427,6 +457,253 @@ namespace XLua
         {
             public string Name;
             public bool IsStatic;
+        }
+
+        static void makeReflectionWrap(RealStatePtr L, Type type, int cls_field, int cls_getter, int cls_setter,
+            int obj_field, int obj_getter, int obj_setter, int obj_meta, out LuaCSFunction item_getter, out LuaCSFunction item_setter, bool private_access = false)
+        {
+            ObjectTranslator translator = ObjectTranslatorPool.Instance.Find(L);
+            BindingFlags flag = BindingFlags.DeclaredOnly | BindingFlags.Instance | BindingFlags.Static | (private_access ? BindingFlags.NonPublic : BindingFlags.Public);
+            FieldInfo[] fields = type.GetFields(flag);
+            EventInfo[] all_events = type.GetEvents(flag | BindingFlags.Public | BindingFlags.NonPublic);
+
+            for (int i = 0; i < fields.Length; ++i)
+            {
+                FieldInfo field = fields[i];
+                string fieldName = field.Name;
+                if (private_access)
+                {
+                    // skip hotfix inject field
+                    if (field.IsStatic && (field.Name.StartsWith("__Hotfix") || field.Name.StartsWith("_c__Hotfix")) && typeof(Delegate).IsAssignableFrom(field.FieldType))
+                    {
+                        continue;
+                    }
+                    if (all_events.Any(e => e.Name == fieldName))
+                    {
+                        fieldName = "&" + fieldName;
+                    }
+                }
+                if (field.IsStatic && (field.IsInitOnly || field.IsLiteral))
+                {
+                    LuaAPI.xlua_pushasciistring(L, fieldName);
+                    translator.PushAny(L, field.GetValue(null));
+                    LuaAPI.lua_rawset(L, cls_field);
+                }
+                else
+                {
+                    LuaAPI.xlua_pushasciistring(L, fieldName);
+                    translator.PushFixCSFunction(L, genFieldGetter(type, field));
+                    LuaAPI.lua_rawset(L, field.IsStatic ? cls_getter : obj_getter);
+
+                    LuaAPI.xlua_pushasciistring(L, fieldName);
+                    translator.PushFixCSFunction(L, genFieldSetter(type, field));
+                    LuaAPI.lua_rawset(L, field.IsStatic ? cls_setter : obj_setter);
+                }
+            }
+
+            EventInfo[] events = type.GetEvents(flag);
+            for (int i = 0; i < events.Length; ++i)
+            {
+                EventInfo eventInfo = events[i];
+                LuaAPI.xlua_pushasciistring(L, eventInfo.Name);
+                translator.PushFixCSFunction(L, translator.methodWrapsCache.GetEventWrap(type, eventInfo.Name));
+                bool is_static = (eventInfo.GetAddMethod() != null) ? eventInfo.GetAddMethod().IsStatic : eventInfo.GetRemoveMethod().IsStatic;
+                LuaAPI.lua_rawset(L, is_static ? cls_field : obj_field);
+            }
+
+            Dictionary<string, PropertyInfo> prop_map = new Dictionary<string, PropertyInfo>();
+            List<PropertyInfo> items = new List<PropertyInfo>();
+            PropertyInfo[] props = type.GetProperties(flag);
+            for (int i = 0; i < props.Length; ++i)
+            {
+                PropertyInfo prop = props[i];
+                if (prop.Name == "Item" && prop.GetIndexParameters().Length > 0)
+                {
+                    items.Add(prop);
+                }
+                else
+                {
+                    prop_map.Add(prop.Name, prop);
+                }
+            }
+
+            var item_array = items.ToArray();
+            item_getter = item_array.Length > 0 ? genItemGetter(type, item_array) : null;
+            item_setter = item_array.Length > 0 ? genItemSetter(type, item_array) : null; ;
+            MethodInfo[] methods = type.GetMethods(flag);
+            Dictionary<MethodKey, List<MemberInfo>> pending_methods = new Dictionary<MethodKey, List<MemberInfo>>();
+            for (int i = 0; i < methods.Length; ++i)
+            {
+                MethodInfo method = methods[i];
+                string method_name = method.Name;
+
+                MethodKey method_key = new MethodKey { Name = method_name, IsStatic = method.IsStatic };
+                List<MemberInfo> overloads;
+                if (pending_methods.TryGetValue(method_key, out overloads))
+                {
+                    overloads.Add(method);
+                    continue;
+                }
+
+                PropertyInfo prop = null;
+                if (method_name.StartsWith("add_") || method_name.StartsWith("remove_")
+                    || method_name == "get_Item" || method_name == "set_Item")
+                {
+                    continue;
+                }
+
+                if (method_name.StartsWith("op_")) // 操作符
+                {
+                    if (InternalGlobals.supportOp.ContainsKey(method_name))
+                    {
+                        if (overloads == null)
+                        {
+                            overloads = new List<MemberInfo>();
+                            pending_methods.Add(method_key, overloads);
+                        }
+                        overloads.Add(method);
+                    }
+                    continue;
+                }
+                else if (method_name.StartsWith("get_") && method.IsSpecialName) // getter of property
+                {
+                    string prop_name = method.Name.Substring(4);
+                    if (!prop_map.TryGetValue(prop_name, out prop))
+                    {
+                        prop = type.GetProperty(prop_name);
+                    }
+                    LuaAPI.xlua_pushasciistring(L, prop.Name);
+                    translator.PushFixCSFunction(L, genPropGetter(type, prop, method.IsStatic));
+                    LuaAPI.lua_rawset(L, method.IsStatic ? cls_getter : obj_getter);
+                }
+                else if (method_name.StartsWith("set_") && method.IsSpecialName) // setter of property
+                {
+                    string prop_name = method.Name.Substring(4);
+                    if (!prop_map.TryGetValue(prop_name, out prop))
+                    {
+                        prop = type.GetProperty(prop_name);
+                    }
+                    LuaAPI.xlua_pushasciistring(L, prop.Name);
+                    translator.PushFixCSFunction(L, genPropSetter(type, prop, method.IsStatic));
+                    LuaAPI.lua_rawset(L, method.IsStatic ? cls_setter : obj_setter);
+                }
+                else if (method_name == ".ctor" && method.IsConstructor)
+                {
+                    continue;
+                }
+                else
+                {
+                    if (overloads == null)
+                    {
+                        overloads = new List<MemberInfo>();
+                        pending_methods.Add(method_key, overloads);
+                    }
+                    overloads.Add(method);
+                }
+            }
+
+
+            IEnumerable<MethodInfo> extend_methods = GetExtensionMethodsOf(type);
+            if (extend_methods != null)
+            {
+                foreach (var extend_method in extend_methods)
+                {
+                    MethodKey method_key = new MethodKey { Name = extend_method.Name, IsStatic = false };
+                    List<MemberInfo> overloads;
+                    if (pending_methods.TryGetValue(method_key, out overloads))
+                    {
+                        overloads.Add(extend_method);
+                        continue;
+                    }
+                    else
+                    {
+                        overloads = new List<MemberInfo>() { extend_method };
+                        pending_methods.Add(method_key, overloads);
+                    }
+                }
+            }
+
+            foreach (var kv in pending_methods)
+            {
+                if (kv.Key.Name.StartsWith("op_")) // 操作符
+                {
+                    LuaAPI.xlua_pushasciistring(L, InternalGlobals.supportOp[kv.Key.Name]);
+                    translator.PushFixCSFunction(L,
+                        new LuaCSFunction(translator.methodWrapsCache._GenMethodWrap(type, kv.Key.Name, kv.Value.ToArray()).Call));
+                    LuaAPI.lua_rawset(L, obj_meta);
+                }
+                else
+                {
+                    LuaAPI.xlua_pushasciistring(L, kv.Key.Name);
+                    translator.PushFixCSFunction(L,
+                        new LuaCSFunction(translator.methodWrapsCache._GenMethodWrap(type, kv.Key.Name, kv.Value.ToArray()).Call));
+                    LuaAPI.lua_rawset(L, kv.Key.IsStatic ? cls_field : obj_field);
+                }
+            }
+        }
+
+        public static void loadUpvalue(RealStatePtr L, Type type, string metafunc, int num)
+        {
+            ObjectTranslator translator = ObjectTranslatorPool.Instance.Find(L);
+            LuaAPI.xlua_pushasciistring(L, metafunc);
+            LuaAPI.lua_rawget(L, LuaIndexes.LUA_REGISTRYINDEX);
+            translator.Push(L, type);
+            LuaAPI.lua_rawget(L, -2);
+            for (int i = 1; i <= num; i++)
+            {
+                LuaAPI.lua_getupvalue(L, -i, i);
+                if (LuaAPI.lua_isnil(L, -1))
+                {
+                    LuaAPI.lua_pop(L, 1);
+                    LuaAPI.lua_newtable(L);
+                    LuaAPI.lua_pushvalue(L, -1);
+                    LuaAPI.lua_setupvalue(L, -i - 2, i);
+                }
+            }
+            for (int i = 0; i < num; i++)
+            {
+                LuaAPI.lua_remove(L, -num - 1);
+            }
+        }
+
+        public static void MakePrivateAccessible(RealStatePtr L, Type type)
+        {
+            int oldTop = LuaAPI.lua_gettop(L);
+
+            LuaAPI.luaL_getmetatable(L, type.FullName);
+            if (LuaAPI.lua_isnil(L, -1))
+            {
+                LuaAPI.lua_settop(L, oldTop);
+                throw new Exception("can not find the metatable for " + type);
+            }
+            int obj_meta = LuaAPI.lua_gettop(L);
+
+            LoadCSTable(L, type);
+            if (LuaAPI.lua_isnil(L, -1))
+            {
+                LuaAPI.lua_settop(L, oldTop);
+                throw new Exception("can not find the class for " + type);
+            }
+            int cls_field = LuaAPI.lua_gettop(L);
+
+            loadUpvalue(L, type, LuaIndexsFieldName, 2);
+            int obj_getter = LuaAPI.lua_gettop(L);
+            int obj_field = obj_getter - 1;
+
+            loadUpvalue(L, type, LuaNewIndexsFieldName, 1);
+            int obj_setter = LuaAPI.lua_gettop(L);
+
+            loadUpvalue(L, type, LuaClassIndexsFieldName, 1);
+            int cls_getter = LuaAPI.lua_gettop(L);
+
+            loadUpvalue(L, type, LuaClassNewIndexsFieldName, 1);
+            int cls_setter = LuaAPI.lua_gettop(L);
+
+            LuaCSFunction item_getter;
+            LuaCSFunction item_setter;
+            makeReflectionWrap(L, type, cls_field, cls_getter, cls_setter, obj_field, obj_getter, obj_setter, obj_meta,
+                out item_getter, out item_setter, true);
+            LuaAPI.lua_settop(L, oldTop);
         }
 
         public static void ReflectionWrap(RealStatePtr L, Type type)
@@ -461,149 +738,10 @@ namespace XLua
             LuaAPI.lua_newtable(L);
             int cls_setter = LuaAPI.lua_gettop(L);
 
-            BindingFlags flag = BindingFlags.DeclaredOnly | BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static;
-            FieldInfo[] fields = type.GetFields(flag);
-
-            for(int i = 0; i < fields.Length; ++i)
-            {
-                FieldInfo field = fields[i];
-                if (field.IsStatic && (field.IsInitOnly || field.IsLiteral))
-                {
-                    LuaAPI.xlua_pushasciistring(L, field.Name);
-                    translator.PushAny(L, field.GetValue(null));
-                    LuaAPI.lua_rawset(L, cls_field);
-                }
-                else
-                {
-                    LuaAPI.xlua_pushasciistring(L, field.Name);
-                    translator.PushFixCSFunction(L, genFieldGetter(type, field));
-                    LuaAPI.lua_rawset(L, field.IsStatic ? cls_getter : obj_getter);
-
-                    LuaAPI.xlua_pushasciistring(L, field.Name);
-                    translator.PushFixCSFunction(L, genFieldSetter(type, field));
-                    LuaAPI.lua_rawset(L, field.IsStatic ? cls_setter : obj_setter);
-                }
-            }
-
-            EventInfo[] events = type.GetEvents(flag);
-            for(int i = 0; i < events.Length; ++i)
-            {
-                EventInfo eventInfo = events[i];
-                LuaAPI.xlua_pushasciistring(L, eventInfo.Name);
-                translator.PushFixCSFunction(L, translator.methodWrapsCache.GetEventWrap(type, eventInfo.Name));
-                bool is_static = (eventInfo.GetAddMethod() != null) ? eventInfo.GetAddMethod().IsStatic : eventInfo.GetRemoveMethod().IsStatic;
-                LuaAPI.lua_rawset(L, is_static ? cls_field : obj_field);
-            }
-
-            Dictionary<string, PropertyInfo> prop_map = new Dictionary<string, PropertyInfo>();
-            List<PropertyInfo> items = new List<PropertyInfo>();
-            PropertyInfo[] props = type.GetProperties(flag);
-            for(int i = 0; i < props.Length; ++i)
-            {
-                PropertyInfo prop = props[i];
-                if (prop.Name == "Item")
-                {
-                    items.Add(prop);
-                }
-                else
-                {
-                    prop_map.Add(prop.Name, prop);
-                }
-            }
-
-            var item_array = items.ToArray();
-            LuaCSFunction item_getter = item_array.Length > 0 ? genItemGetter(type, item_array) : null;
-            LuaCSFunction item_setter = item_array.Length > 0 ? genItemSetter(type, item_array) : null; ;
-            MethodInfo[] methods = type.GetMethods(flag);
-            Dictionary<MethodKey, List<MemberInfo>> pending_methods = new Dictionary<MethodKey, List<MemberInfo>>();
-            for (int i = 0; i < methods.Length; ++i)
-            {
-                MethodInfo method = methods[i];
-                string method_name = method.Name;
-
-                MethodKey method_key = new MethodKey { Name = method_name, IsStatic = method.IsStatic };
-                List<MemberInfo> overloads;
-                if (pending_methods.TryGetValue(method_key, out overloads))
-                {
-                    overloads.Add(method);
-                    continue;
-                }
-
-                PropertyInfo prop = null;
-                if (method_name.StartsWith("add_") || method_name.StartsWith("remove_") 
-                    || method_name == "get_Item" || method_name == "set_Item")
-                {
-                    continue;
-                }
-
-                if (method_name.StartsWith("op_")) // 操作符
-                {
-                    if (support_op.ContainsKey(method_name))
-                    {
-                        if (overloads == null)
-                        {
-                            overloads = new List<MemberInfo>();
-                            pending_methods.Add(method_key, overloads);
-                        }
-                        overloads.Add(method);
-                    }
-                    continue;
-                }
-                else if (method_name.StartsWith("get_") && prop_map.TryGetValue(method.Name.Substring(4), out prop)) // getter of property
-                {
-                    LuaAPI.xlua_pushasciistring(L, prop.Name);
-                    translator.PushFixCSFunction(L, genPropGetter(type, prop, method.IsStatic));
-                    LuaAPI.lua_rawset(L, method.IsStatic ? cls_getter : obj_getter);
-                }
-                else if (method_name.StartsWith("set_") && prop_map.TryGetValue(method.Name.Substring(4), out prop)) // setter of property
-                {
-                    LuaAPI.xlua_pushasciistring(L, prop.Name);
-                    translator.PushFixCSFunction(L, genPropSetter(type, prop, method.IsStatic));
-                    LuaAPI.lua_rawset(L, method.IsStatic ? cls_setter : obj_setter);
-                }
-                else if (method_name == ".ctor" && method.IsConstructor)
-                {
-                    continue;
-                }
-                else
-                {
-                    if (overloads == null)
-                    {
-                        overloads = new List<MemberInfo>();
-                        pending_methods.Add(method_key, overloads);
-                    }
-                    overloads.Add(method);
-                }
-            }
-
-            foreach (var kv in pending_methods)
-            {
-                if (kv.Key.Name.StartsWith("op_")) // 操作符
-                {
-                    LuaAPI.xlua_pushasciistring(L, support_op[kv.Key.Name]);
-                    translator.PushFixCSFunction(L,
-                        new LuaCSFunction(translator.methodWrapsCache._GenMethodWrap(type, kv.Key.Name, kv.Value.ToArray()).Call));
-                    LuaAPI.lua_rawset(L, obj_meta);
-                }
-                else
-                {
-                    LuaAPI.xlua_pushasciistring(L, kv.Key.Name);
-                    translator.PushFixCSFunction(L,
-                        new LuaCSFunction(translator.methodWrapsCache._GenMethodWrap(type, kv.Key.Name, kv.Value.ToArray()).Call));
-                    LuaAPI.lua_rawset(L, kv.Key.IsStatic ? cls_field : obj_field);
-                }
-            }
-
-            IEnumerable<MethodInfo> extend_methods = GetExtensionMethodsOf(type);
-            if (extend_methods != null)
-            {
-                foreach(var kv in (from extend_method in extend_methods select (MemberInfo)extend_method into member group member by member.Name))
-                {
-                    LuaAPI.xlua_pushasciistring(L, kv.Key);
-                    translator.PushFixCSFunction(L, new LuaCSFunction(translator.methodWrapsCache._GenMethodWrap(type, kv.Key, kv).Call));
-                    LuaAPI.lua_rawset(L, obj_field);
-                }
-            }
+            LuaCSFunction item_getter;
+            LuaCSFunction item_setter;
+            makeReflectionWrap(L, type, cls_field, cls_getter, cls_setter, obj_field, obj_getter, obj_setter, obj_meta,
+                out item_getter, out item_setter);
 
             // init obj metatable
             LuaAPI.xlua_pushasciistring(L, "__gc");
@@ -618,13 +756,13 @@ namespace XLua
             LuaAPI.lua_pushvalue(L, obj_field);
             LuaAPI.lua_pushvalue(L, obj_getter);
             translator.PushFixCSFunction(L, item_getter);
-            translator.PushAny(L, type.BaseType);
-            LuaAPI.xlua_pushasciistring(L, Utils.LuaIndexsFieldName);
+            translator.PushAny(L, type.BaseType());
+            LuaAPI.xlua_pushasciistring(L, LuaIndexsFieldName);
             LuaAPI.lua_rawget(L, LuaIndexes.LUA_REGISTRYINDEX);
             LuaAPI.lua_pushnil(L);
             LuaAPI.gen_obj_indexer(L);
             //store in lua indexs function tables
-            LuaAPI.xlua_pushasciistring(L, Utils.LuaIndexsFieldName);
+            LuaAPI.xlua_pushasciistring(L, LuaIndexsFieldName);
             LuaAPI.lua_rawget(L, LuaIndexes.LUA_REGISTRYINDEX);
             translator.Push(L, type);
             LuaAPI.lua_pushvalue(L, -3);
@@ -635,13 +773,13 @@ namespace XLua
             LuaAPI.xlua_pushasciistring(L, "__newindex");
             LuaAPI.lua_pushvalue(L, obj_setter);
             translator.PushFixCSFunction(L, item_setter);
-            translator.Push(L, type.BaseType);
-            LuaAPI.xlua_pushasciistring(L, Utils.LuaNewIndexsFieldName);
+            translator.Push(L, type.BaseType());
+            LuaAPI.xlua_pushasciistring(L, LuaNewIndexsFieldName);
             LuaAPI.lua_rawget(L, LuaIndexes.LUA_REGISTRYINDEX);
             LuaAPI.lua_pushnil(L);
             LuaAPI.gen_obj_newindexer(L);
             //store in lua newindexs function tables
-            LuaAPI.xlua_pushasciistring(L, Utils.LuaNewIndexsFieldName);
+            LuaAPI.xlua_pushasciistring(L, LuaNewIndexsFieldName);
             LuaAPI.lua_rawget(L, LuaIndexes.LUA_REGISTRYINDEX);
             translator.Push(L, type);
             LuaAPI.lua_pushvalue(L, -3);
@@ -654,7 +792,7 @@ namespace XLua
             translator.PushAny(L, type);
             LuaAPI.lua_rawset(L, cls_field);
 
-            if (type != null && type.IsEnum)
+            if (type != null && type.IsEnum())
             {
                 LuaAPI.xlua_pushasciistring(L, "__CastFrom");
                 translator.PushFixCSFunction(L, genEnumCastFrom(type));
@@ -669,12 +807,12 @@ namespace XLua
             LuaAPI.xlua_pushasciistring(L, "__index");
             LuaAPI.lua_pushvalue(L, cls_getter);
             LuaAPI.lua_pushvalue(L, cls_field);
-            translator.Push(L, type.BaseType);
-            LuaAPI.xlua_pushasciistring(L, Utils.LuaClassIndexsFieldName);
+            translator.Push(L, type.BaseType());
+            LuaAPI.xlua_pushasciistring(L, LuaClassIndexsFieldName);
             LuaAPI.lua_rawget(L, LuaIndexes.LUA_REGISTRYINDEX);
             LuaAPI.gen_cls_indexer(L);
             //store in lua indexs function tables
-            LuaAPI.xlua_pushasciistring(L, Utils.LuaClassIndexsFieldName);
+            LuaAPI.xlua_pushasciistring(L, LuaClassIndexsFieldName);
             LuaAPI.lua_rawget(L, LuaIndexes.LUA_REGISTRYINDEX);
             translator.Push(L, type);
             LuaAPI.lua_pushvalue(L, -3);
@@ -684,12 +822,12 @@ namespace XLua
 
             LuaAPI.xlua_pushasciistring(L, "__newindex");
             LuaAPI.lua_pushvalue(L, cls_setter);
-            translator.Push(L, type.BaseType);
-            LuaAPI.xlua_pushasciistring(L, Utils.LuaClassNewIndexsFieldName);
+            translator.Push(L, type.BaseType());
+            LuaAPI.xlua_pushasciistring(L, LuaClassNewIndexsFieldName);
             LuaAPI.lua_rawget(L, LuaIndexes.LUA_REGISTRYINDEX);
             LuaAPI.gen_cls_newindexer(L);
             //store in lua newindexs function tables
-            LuaAPI.xlua_pushasciistring(L, Utils.LuaClassNewIndexsFieldName);
+            LuaAPI.xlua_pushasciistring(L, LuaClassNewIndexsFieldName);
             LuaAPI.lua_rawget(L, LuaIndexes.LUA_REGISTRYINDEX);
             translator.Push(L, type);
             LuaAPI.lua_pushvalue(L, -3);
@@ -784,10 +922,10 @@ namespace XLua
             return idx > 0 ? idx : top + idx + 1;
         }
 
-        public static readonly int OBJ_META_IDX = -4;
-        public static readonly int METHOD_IDX = -3;
-        public static readonly int GETTER_IDX = -2;
-        public static readonly int SETTER_IDX = -1;
+        public const int OBJ_META_IDX = -4;
+        public const int METHOD_IDX = -3;
+        public const int GETTER_IDX = -2;
+        public const int SETTER_IDX = -1;
 
         public static void EndObjectRegister(Type type, RealStatePtr L, ObjectTranslator translator, LuaCSFunction csIndexer,
             LuaCSFunction csNewIndexer, Type base_type, LuaCSFunction arrayIndexer, LuaCSFunction arrayNewIndexer)
@@ -812,9 +950,9 @@ namespace XLua
                 LuaAPI.lua_pushstdcallcfunction(L, csIndexer);
             }
 
-            translator.Push(L, type == null ? base_type : type.BaseType);
+            translator.Push(L, type == null ? base_type : type.BaseType());
 
-            LuaAPI.xlua_pushasciistring(L, Utils.LuaIndexsFieldName);
+            LuaAPI.xlua_pushasciistring(L, LuaIndexsFieldName);
             LuaAPI.lua_rawget(L, LuaIndexes.LUA_REGISTRYINDEX);
             if (arrayIndexer == null)
             {
@@ -829,7 +967,7 @@ namespace XLua
 
             if (type != null)
             {
-                LuaAPI.xlua_pushasciistring(L, Utils.LuaIndexsFieldName);
+                LuaAPI.xlua_pushasciistring(L, LuaIndexsFieldName);
                 LuaAPI.lua_rawget(L, LuaIndexes.LUA_REGISTRYINDEX);//store in lua indexs function tables
                 translator.Push(L, type);
                 LuaAPI.lua_pushvalue(L, -3);
@@ -853,9 +991,9 @@ namespace XLua
                 LuaAPI.lua_pushstdcallcfunction(L, csNewIndexer);
             }
 
-            translator.Push(L, type == null ? base_type : type.BaseType);
+            translator.Push(L, type == null ? base_type : type.BaseType());
 
-            LuaAPI.xlua_pushasciistring(L, Utils.LuaNewIndexsFieldName);
+            LuaAPI.xlua_pushasciistring(L, LuaNewIndexsFieldName);
             LuaAPI.lua_rawget(L, LuaIndexes.LUA_REGISTRYINDEX);
 
             if (arrayNewIndexer == null)
@@ -871,7 +1009,7 @@ namespace XLua
 
             if (type != null)
             {
-                LuaAPI.xlua_pushasciistring(L, Utils.LuaNewIndexsFieldName);
+                LuaAPI.xlua_pushasciistring(L, LuaNewIndexsFieldName);
                 LuaAPI.lua_rawget(L, LuaIndexes.LUA_REGISTRYINDEX);//store in lua newindexs function tables
                 translator.Push(L, type);
                 LuaAPI.lua_pushvalue(L, -3);
@@ -939,10 +1077,10 @@ namespace XLua
             LuaAPI.lua_setmetatable(L, cls_table);
         }
 
-        public static readonly int CLS_IDX = -4;
-        public static readonly int CLS_META_IDX = -3;
-        public static readonly int CLS_GETTER_IDX = -2;
-        public static readonly int CLS_SETTER_IDX = -1;
+        public const int CLS_IDX = -4;
+        public const int CLS_META_IDX = -3;
+        public const int CLS_GETTER_IDX = -2;
+        public const int CLS_SETTER_IDX = -1;
 
         public static void EndClassRegister(Type type, RealStatePtr L, ObjectTranslator translator)
         {
@@ -956,12 +1094,12 @@ namespace XLua
             LuaAPI.xlua_pushasciistring(L, "__index");
             LuaAPI.lua_pushvalue(L, cls_getter_idx);
             LuaAPI.lua_pushvalue(L, cls_idx);
-            translator.Push(L, type.BaseType);
-            LuaAPI.xlua_pushasciistring(L, Utils.LuaClassIndexsFieldName);
+            translator.Push(L, type.BaseType());
+            LuaAPI.xlua_pushasciistring(L, LuaClassIndexsFieldName);
             LuaAPI.lua_rawget(L, LuaIndexes.LUA_REGISTRYINDEX);
             LuaAPI.gen_cls_indexer(L);
 
-            LuaAPI.xlua_pushasciistring(L, Utils.LuaClassIndexsFieldName);
+            LuaAPI.xlua_pushasciistring(L, LuaClassIndexsFieldName);
             LuaAPI.lua_rawget(L, LuaIndexes.LUA_REGISTRYINDEX);//store in lua indexs function tables
             translator.Push(L, type);
             LuaAPI.lua_pushvalue(L, -3);
@@ -974,12 +1112,12 @@ namespace XLua
             //begin cls newindex
             LuaAPI.xlua_pushasciistring(L, "__newindex");
             LuaAPI.lua_pushvalue(L, cls_setter_idx);
-            translator.Push(L, type.BaseType);
-            LuaAPI.xlua_pushasciistring(L, Utils.LuaClassNewIndexsFieldName);
+            translator.Push(L, type.BaseType());
+            LuaAPI.xlua_pushasciistring(L, LuaClassNewIndexsFieldName);
             LuaAPI.lua_rawget(L, LuaIndexes.LUA_REGISTRYINDEX);
             LuaAPI.gen_cls_newindexer(L);
 
-            LuaAPI.xlua_pushasciistring(L, Utils.LuaClassNewIndexsFieldName);
+            LuaAPI.xlua_pushasciistring(L, LuaClassNewIndexsFieldName);
             LuaAPI.lua_rawget(L, LuaIndexes.LUA_REGISTRYINDEX);//store in lua newindexs function tables
             translator.Push(L, type);
             LuaAPI.lua_pushvalue(L, -3);
@@ -1017,7 +1155,10 @@ namespace XLua
         public static void LoadCSTable(RealStatePtr L, Type type)
         {
             int oldTop = LuaAPI.lua_gettop(L);
-            LuaAPI.lua_getglobal(L, "CS");
+            if (0 != LuaAPI.xlua_getglobal(L, "CS"))
+            {
+                throw new Exception("call xlua_getglobal fail!");
+            }
 
             List<string> path = getPathOfType(type);
 
@@ -1044,7 +1185,10 @@ namespace XLua
         {
             int oldTop = LuaAPI.lua_gettop(L);
             cls_table = abs_idx(oldTop, cls_table);
-            LuaAPI.lua_getglobal(L, "CS");
+            if (0 != LuaAPI.xlua_getglobal(L, "CS"))
+            {
+                throw new Exception("call xlua_getglobal fail!");
+            }
 
             List<string> path = getPathOfType(type);
 
@@ -1078,13 +1222,13 @@ namespace XLua
             LuaAPI.lua_pop(L, 1);
         }
 
-        public static string LuaIndexsFieldName = "LuaIndexs";
+        public const string LuaIndexsFieldName = "LuaIndexs";
 
-        public static string LuaNewIndexsFieldName = "LuaNewIndexs";
+        public const string LuaNewIndexsFieldName = "LuaNewIndexs";
 
-        public static string LuaClassIndexsFieldName = "LuaClassIndexs";
+        public const string LuaClassIndexsFieldName = "LuaClassIndexs";
 
-        public static string LuaClassNewIndexsFieldName = "LuaClassNewIndexs";
+        public const string LuaClassNewIndexsFieldName = "LuaClassNewIndexs";
 
         public static bool IsParamsMatch(MethodInfo delegateMethod, MethodInfo bridgeMethod)
         {
@@ -1112,6 +1256,52 @@ namespace XLua
             }
 
             return true;
+        }
+
+        public static bool IsSupportedExtensionMethod(MethodBase method)
+        {
+            if (!method.IsDefined(typeof(ExtensionAttribute), false))
+                return false;
+            if (!method.ContainsGenericParameters)
+                return true;
+            var methodParameters = method.GetParameters();
+            var hasValidGenericParameter = false;
+            for (var i = 0; i < methodParameters.Length; i++)
+            {
+                var parameterType = methodParameters[i].ParameterType;
+                if (parameterType.IsGenericParameter)
+                {
+                    var parameterConstraints = parameterType.GetGenericParameterConstraints();
+                    if (parameterConstraints.Length == 0 || !parameterConstraints[0].IsClass())
+                        return false;
+                    hasValidGenericParameter = true;
+                }
+            }
+            return hasValidGenericParameter;
+        }
+
+        private static Type getExtendedType(MethodInfo method)
+        {
+            var type = method.GetParameters()[0].ParameterType;
+            if (!type.IsGenericParameter)
+                return type;
+            var parameterConstraints = type.GetGenericParameterConstraints();
+            if (parameterConstraints.Length == 0)
+                throw new InvalidOperationException();
+
+            var firstParameterConstraint = parameterConstraints[0];
+            if (!firstParameterConstraint.IsClass())
+                throw new InvalidOperationException();
+            return firstParameterConstraint;
+        }
+
+        public static bool IsStaticPInvokeCSFunction(LuaCSFunction csFunction)
+        {
+#if UNITY_WSA && !UNITY_EDITOR
+            return csFunction.GetMethodInfo().IsStatic && csFunction.GetMethodInfo().GetCustomAttribute<MonoPInvokeCallbackAttribute>() != null;
+#else
+            return csFunction.Method.IsStatic && Attribute.IsDefined(csFunction.Method, typeof(MonoPInvokeCallbackAttribute));
+#endif
         }
     }
 }
